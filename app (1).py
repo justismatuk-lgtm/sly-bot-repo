@@ -34,7 +34,7 @@ def load_config():
             return {}
     else:
         # Create a template if it doesn't exist so it stops crashing
-        default_config = {"token": "MTUxNjU2MTk4NDg1Njc4OTE1Mw.GDn77a.ok-k1oZNOjz9ZZ6yzOBAr_-mswCwKvXBlZrKQ4"}
+        default_config = {"token": "M"}
         try:
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(default_config, f, indent=4)
