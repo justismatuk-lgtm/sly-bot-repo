@@ -14,7 +14,7 @@ intents.message_content = True  # CRUCIAL: Monitoring active chat words!
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # --- CONFIGURATION ---
-TARGET_MEMBER_ID = 185187074435973129  # Sly's User ID
+TARGET_MEMBER_ID = 1  # Sly's User ID
 DATA_FILE = "booms.json"
 CONFIG_FILE = "config.json"
 LISTS_FILE = "lists.json"
