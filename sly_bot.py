@@ -7,26 +7,55 @@ from datetime import datetime, timedelta, timezone
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
-import pytz  # Ensure pytz is installed for precise EST/EDT tracking
 
 intents = discord.Intents.default()
-intents.message_content = True  # CRUCIAL: Allows the bot to monitor chat words!
+intents.message_content = True  # CRUCIAL: Monitoring active chat words!
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # --- CONFIGURATION ---
-TARGET_MEMBER_ID = 185187074435973129  # Sly's User ID
+TARGET_MEMBER_ID = XXXXXXXXXXX  # Sly's User ID
 DATA_FILE = "booms.json"
 CONFIG_FILE = "config.json"
 LISTS_FILE = "lists.json"
+TRIGGERS_FILE = "salmon_triggers.json"  
+QUOTES_FILE = "sly_quotes.json"        
+SHOP_FILE = "shop_titles.json"         # NEW: Title database file
 # ---------------------
 
+def load_config():
+    """Loads the main bot token and global variables from config.json."""
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"Error loading config file: {e}")
+            return {}
+    else:
+        # Create a template if it doesn't exist so it stops crashing
+        default_config = {"token": "XXXXXXXXX"}
+        try:
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(default_config, f, indent=4)
+        except Exception:
+            pass
+        return default_config
+
+def save_config(config_data):
+    """Saves structural changes back to config.json."""
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(config_data, f, indent=4)
+    except Exception as e:
+        print(f"Error saving config file: {e}")
+
 LAST_USED_TIME = 0  
-ACTIVE_BOUNTY_CHANNEL = None  # Tracks if a bounty is currently live
+ACTIVE_BOUNTY_CHANNEL = None  
+WEEKLY_TRIGGER_COUNTS = {}
 
 # --- STATIC ASSETS ENGINE ---
 def load_static_lists():
-    """Loads text assets, text blocks, and loot tables from an external JSON."""
     if not os.path.exists(LISTS_FILE):
         print(f"CRITICAL WARNING: {LISTS_FILE} not found! Initializing empty fallback pools.")
         return {"intros": [], "bot_rants": [], "loot_items": []}
@@ -37,34 +66,59 @@ def load_static_lists():
         print(f"Error reading asset file {LISTS_FILE}: {e}")
         return {"intros": [], "bot_rants": [], "loot_items": []}
 
-# Automatically extract the pools right when the bot initiates
 ASSETS = load_static_lists()
 INTROS = ASSETS["intros"]
 BOT_RANTS = ASSETS["bot_rants"]
 LOOT_ITEMS = ASSETS["loot_items"]
 
 # --- DATA STORAGE HELPER FUNCTIONS ---
-def load_config():
-    if os.path.exists(CONFIG_FILE):
+def load_shop_titles():
+    """Loads titles inventory from shop_titles.json."""
+    if os.path.exists(SHOP_FILE):
         try:
-            with open(CONFIG_FILE, "r") as f:
-                return json.load(f)
+            with open(SHOP_FILE, "r", encoding="utf-8") as f:
+                return json.load(f).get("titles", {})
         except Exception as e:
-            print(f"Error loading config.json: {e}")
+            print(f"Error loading shop file: {e}")
             return {}
     return {}
 
+def load_salmon_triggers():
+    default_triggers = [
+        "goon", "rage bait", "fuck", "kill", "walmart", "burger king", "whopper", 
+        "quarter pounder", "lawn", "mom", "gram", "waifu", "door dash", "rivals",
+        "uninstall", "target", "call in", "calling in", "mcdonalds", "fucking", 
+        "dump", "salmon", "bk"
+    ]
+    if not os.path.exists(TRIGGERS_FILE):
+        try:
+            with open(TRIGGERS_FILE, "w", encoding="utf-8") as f:
+                json.dump({"triggers": default_triggers}, f, indent=4)
+            return default_triggers
+        except Exception:
+            return default_triggers
+    try:
+        with open(TRIGGERS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f).get("triggers", default_triggers)
+    except Exception:
+        return default_triggers
+
+def load_sly_quotes():
+    if os.path.exists(QUOTES_FILE):
+        try:
+            with open(QUOTES_FILE, "r", encoding="utf-8") as f:
+                return json.load(f).get("quotes", [])
+        except Exception:
+            return []
+    return []
+
 def load_boom_data():
-    """
-    Loads boom data and seamlessly upgrades the schema if a user profile 
-    is missing weekly metrics or the absolute career tracking metric.
-    """
+    """Loads user balances and upgrades old profiles to support unlocked/active titles."""
     if os.path.exists(DATA_FILE):
         try:
             with open(DATA_FILE, "r") as f:
                 data = json.load(f)
             
-            # --- SCHEMA UPGRADE ENGINE ---
             upgraded = False
             for user_id, profile in data.items():
                 if "weekly_booms" not in profile:
@@ -76,9 +130,18 @@ def load_boom_data():
                 if "weekly_rolls_count" not in profile:
                     profile["weekly_rolls_count"] = 0
                     upgraded = True
-                # NEW: Initialize career absolute tracking to match current total if missing
                 if "career_booms_earned" not in profile:
                     profile["career_booms_earned"] = profile.get("total_booms", 0)
+                    upgraded = True
+                if "salmon_triggers_tripped" not in profile:
+                    profile["salmon_triggers_tripped"] = 0
+                    upgraded = True
+                # TITLE INVENTORY SCHEMAS HOOK
+                if "unlocked_titles" not in profile:
+                    profile["unlocked_titles"] = []
+                    upgraded = True
+                if "active_title" not in profile:
+                    profile["active_title"] = None
                     upgraded = True
 
             if upgraded:
@@ -95,19 +158,21 @@ def save_boom_data(data):
     except Exception as e:
         print(f"Error saving boom data: {e}")
 
-
 @bot.event
 async def on_ready():
     print(f"Logged in successfully as {bot.user.name}")
+    load_salmon_triggers()
+    load_shop_titles()
     try:
         await bot.tree.sync()
         print("Global command tree sync complete!")
     except Exception as e:
         print(f"Failed to sync commands: {e}")
     
-    # Start the background clock loop if it isn't running
     if not weekly_reset_loop.is_running():
         weekly_reset_loop.start()
+    if not trigger_report_loop.is_running():
+        trigger_report_loop.start()
 
 # ==========================================
 # PASSIVE ENGINE: HIGH-STAKES SLY BACKGROUND MONITORING
@@ -252,7 +317,7 @@ async def on_message(message: discord.Message):
             return
 
     await bot.process_commands(message)
-
+    
 # ==========================================
 # COMMAND 1: THE ORIGINAL /WWSD COMMAND (COSTS 5 BOOMS!)
 # ==========================================
@@ -334,7 +399,6 @@ async def wwsd(interaction: discord.Interaction):
     else:
         await interaction.followup.send("I couldn't find any recent messages from that member!")
 
-
 # ==========================================
 # COMMAND 2: ALL-TIME BOOM COUNTER (WITH ROLLING 24H LIMIT)
 # ==========================================
@@ -404,7 +468,6 @@ async def rollforboom(interaction: discord.Interaction):
     )
     await interaction.response.send_message(response)
 
-
 # ==========================================
 # COMMAND 3: THE HIGH-STAKES BOOM CASINO
 # ==========================================
@@ -444,6 +507,95 @@ async def gambleboom(interaction: discord.Interaction, wager: int):
     await interaction.response.send_message(response)
 
 # ==========================================
+# NEW FEATURE COMMANDS: THE FLEX TITLE SHOP SYSTEM
+# ==========================================
+@bot.tree.command(name="wwsd-shop", description="Browse and purchase legendary visual status card titles!")
+async def wwsd_shop(interaction: discord.Interaction):
+    shop = load_shop_titles()
+    if not shop:
+        await interaction.response.send_message("❌ Shop inventory is empty or failing to parse.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="🛒 The Official WWSD Boom Shop",
+        description="Spend your permanent lifetime hoards to permanently unlock flex titles! Use `/wwsd-buy [name]` to purchase.",
+        color=discord.Color.gold()
+    )
+    
+    # Categorize items into organized text blocks
+    categorized = {}
+    for title_name, data in shop.items():
+        tier = data["tier"]
+        if tier not in categorized:
+            categorized[tier] = []
+        categorized[tier].append(f"🔹 **{title_name}** | 💰 Cost: `{data['cost']}` Booms\n*{data['desc']}*")
+
+    for tier, items in categorized.items():
+        embed.add_field(name=f"👑 {tier}", value="\n\n".join(items), inline=False)
+        
+    embed.set_footer(text="No refunds. All transactions final.")
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="wwsd-buy", description="Purchase a specific title card from the vault.")
+@app_commands.describe(title="The exact name of the title card from the shop catalog.")
+async def wwsd_buy(interaction: discord.Interaction, title: str):
+    shop = load_shop_titles()
+    user_id = str(interaction.user.id)
+    boom_data = load_boom_data()
+    
+    # Locate valid casing regardless of input string variations
+    matched_title = next((t for t in shop if t.lower() == title.lower()), None)
+    
+    if not matched_title:
+        await interaction.response.send_message("❌ That title card does not exist in the stock inventory. Double-check spelling!", ephemeral=True)
+        return
+        
+    title_cost = shop[matched_title]["cost"]
+    
+    if user_id not in boom_data or boom_data[user_id]["total_booms"] < title_cost:
+        balance = boom_data[user_id]["total_booms"] if user_id in boom_data else 0
+        await interaction.response.send_message(f"❌ **INSUFFICIENT FUNDS.** `{matched_title}` costs **{title_cost}** Booms. Your wallet holds: **{balance}**.", ephemeral=True)
+        return
+        
+    if matched_title in boom_data[user_id].get("unlocked_titles", []):
+        await interaction.response.send_message(f"🤝 You already own the `{matched_title}` title card! Use `/wwsd-equip` to throw it on.", ephemeral=True)
+        return
+
+    # Process Transaction
+    boom_data[user_id]["total_booms"] -= title_cost
+    boom_data[user_id]["unlocked_titles"].append(matched_title)
+    save_boom_data(boom_data)
+    
+    await interaction.response.send_message(f"🎉 **PURCHASE SUCCESSFUL!** 🎉\nYou spent **{title_cost}** Booms and unlocked the permanent title card: `[{matched_title}]`!\nRun `/wwsd-equip title: {matched_title}` to flash it.")
+
+
+@bot.tree.command(name="wwsd-equip", description="Equip or unequip titles you currently own.")
+@app_commands.describe(title="The title card name to wear, or leave empty/type 'none' to clear.")
+async def wwsd_equip(interaction: discord.Interaction, title: str = "none"):
+    user_id = str(interaction.user.id)
+    boom_data = load_boom_data()
+    
+    if user_id not in boom_data or not boom_data[user_id].get("unlocked_titles", []):
+        await interaction.response.send_message("❌ You haven't unlocked a single title card yet. Go buy something from the `/wwsd-shop`!", ephemeral=True)
+        return
+
+    if title.lower() == "none":
+        boom_data[user_id]["active_title"] = None
+        save_boom_data(boom_data)
+        await interaction.response.send_message("⚙️ Active title badge has been removed. You are currently displaying nothing.")
+        return
+
+    matched_title = next((t for t in boom_data[user_id]["unlocked_titles"] if t.lower() == title.lower()), None)
+    if not matched_title:
+        await interaction.response.send_message("❌ You don't own that title card or spelling was mismatched. Run `/wwsd-whereami` to verify ownership.", ephemeral=True)
+        return
+        
+    boom_data[user_id]["active_title"] = matched_title
+    save_boom_data(boom_data)
+    await interaction.response.send_message(f"✅ **TITLE EQUIPPED!** Your active rank card display badge is now set to: `[{matched_title}]`.")
+
+# ==========================================
 # COMMAND 4: PERSONAL RANK RADAR ENGINE
 # ==========================================
 @bot.tree.command(name="wwsd-whereami", description="Check your current leaderboard rankings across all categories!")
@@ -458,24 +610,39 @@ async def where_ami(interaction: discord.Interaction):
         )
         return
 
+    profile = data[user_id]
+
+    # --- TITLE SHOP CODES INTEGRATION ---
+    # Fetch their active title card or fall back if none is equipped
+    active_badge = f"🏆 `[{profile.get('active_title')}]`" if profile.get("active_title") else "🚫 *No Title Equipped*"
+    
+    # Format their custom unlocked titles locker list
+    unlocked_titles_list = profile.get("unlocked_titles", [])
+    if unlocked_titles_list:
+        unlocked_display = ", ".join([f"`{t}`" for t in unlocked_titles_list])
+    else:
+        unlocked_display = "*None (Visit `/wwsd-shop` to buy custom cards!)*"
+    # ------------------------------------
+
     # 1. Calculate Lifetime Booms Rank using the absolute "career_booms_earned" metric
     lifetime_sorted = sorted(data.items(), key=lambda x: x[1].get("career_booms_earned", 0), reverse=True)
     lifetime_rank = next((i + 1 for i, (uid, _) in enumerate(lifetime_sorted) if uid == user_id), "N/A")
-    lifetime_total_gross = data[user_id].get("career_booms_earned", 0)
-    current_wallet = data[user_id].get("total_booms", 0)
+    lifetime_total_gross = profile.get("career_booms_earned", 0)
+    current_wallet = profile.get("total_booms", 0)
 
     # 2. Calculate Weekly Booms Rank
     weekly_booms_sorted = sorted(data.items(), key=lambda x: x[1].get("weekly_booms", 0), reverse=True)
     weekly_booms_rank = next((i + 1 for i, (uid, _) in enumerate(weekly_booms_sorted) if uid == user_id), "N/A")
-    weekly_booms_total = data[user_id].get("weekly_booms", 0)
+    weekly_booms_total = profile.get("weekly_booms", 0)
 
     # 3. Calculate Weekly Bounties Caught Rank
     weekly_bounties_sorted = sorted(data.items(), key=lambda x: x[1].get("weekly_bounties_caught", 0), reverse=True)
     weekly_bounties_rank = next((i + 1 for i, (uid, _) in enumerate(weekly_bounties_sorted) if uid == user_id), "N/A")
-    weekly_bounties_total = data[user_id].get("weekly_bounties_caught", 0)
+    weekly_bounties_total = profile.get("weekly_bounties_caught", 0)
 
     embed = discord.Embed(
         title=f"📊 Personal Standings: {interaction.user.display_name}",
+        description=f"**Active Equipped Card:** {active_badge}", # Placed prominently right underneath their name
         color=discord.Color.blue(),
         timestamp=datetime.utcnow()
     )
@@ -495,6 +662,13 @@ async def where_ami(interaction: discord.Interaction):
         name="🎣 Salmon Hunting", 
         value=f"**Rank:** #{weekly_bounties_rank}\n**Bounties Caught:** {weekly_bounties_total}", 
         inline=True
+    )
+    
+    # Shows everyone what titles they have hiding inside their personal collection
+    embed.add_field(
+        name="🎒 Unlocked Titles Locker",
+        value=unlocked_display,
+        inline=False
     )
     
     embed.set_footer(text="Maybe you're number 1, maybe you're not, maybe go fuck yourself!!!")
@@ -648,7 +822,6 @@ async def ladderboom(interaction: discord.Interaction, wager: int):
     view = HighLowView(interaction, wager, initial_card, user_id)
     await interaction.response.send_message(start_text, view=view)
 
-
 # ==========================================
 #         AUTOMATIC WEEKLY RESET
 # ==========================================
@@ -723,6 +896,40 @@ async def weekly_reset_loop():
             
         save_boom_data(boom_data)
         print("Weekly metrics clean wipe executed successfully.")
+        
+        # Avoid double-firing within the same minute frame
+        await asyncio.sleep(60)
+
+# ==========================================
+#   TRIGGER WORD CHART LOOP (8:30 PM EST)
+# ==========================================
+@tasks.loop(seconds=60)
+async def trigger_report_loop():
+    global WEEKLY_TRIGGER_COUNTS
+    est_offset = timedelta(hours=-5) 
+    now = datetime.now(timezone(est_offset))
+    
+    if now.weekday() == 4 and now.hour == 20 and now.minute == 30:
+        sorted_hits = sorted(WEEKLY_TRIGGER_COUNTS.items(), key=lambda x: x[1], reverse=True)
+        active_hits = [(word, count) for word, count in sorted_hits if count > 0]
+        report_msg = "🎣 **[THE WEEKLY SALMON TRIGGER BREAKDOWN!]** 🎣\n"
+        
+        if not active_hits:
+            report_msg += "🟩 *Unbelievable. The target did not utter a single recorded trigger keyword this entire week.*"
+        else:
+            report_msg += "```text\n"
+            max_word_len = max(max([len(word) for word, _ in active_hits]), 12)
+            for word, count in active_hits:
+                report_msg += f"{word.upper()}{' ' * (max_word_len - len(word))} | {'█' * count} ({count})\n"
+            report_msg += "```\n"
+            
+        for guild in bot.guilds:
+            alert_channel = discord.utils.get(guild.text_channels, name="boom-channel")
+            if alert_channel:
+                try: await alert_channel.send(report_msg)
+                except Exception: pass
+        WEEKLY_TRIGGER_COUNTS = {}
+        print("Weekly trigger frequency data flushed clean successfully.")
         
         # Avoid double-firing within the same minute frame
         await asyncio.sleep(60)
